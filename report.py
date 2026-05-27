@@ -7,6 +7,9 @@ Exports:
 
 from __future__ import annotations
 
+from dotenv import load_dotenv
+load_dotenv()  # must run before importing anthropic or reading ANTHROPIC_API_KEY
+
 import logging
 import os
 from datetime import datetime
@@ -260,7 +263,7 @@ def generate_report(
         "| 3 | Gross Margin Expansion | Current FY > Prior FY |",
         "| 4 | Market Cap | $2 B – $50 B |",
         "| 5 | Analyst Coverage | < 20 analysts |",
-        "| 6 | Insider Buying | Net buyer (last 90 days) |",
+        "| 6 | Insider Activity | No significant net insider selling (> −$500K over 90 days) |",
         "| 7 | Relative P/E | ≤ 2× GICS sector median |",
         "",
         "## Scoring Weights",

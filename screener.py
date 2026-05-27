@@ -2,19 +2,23 @@
 screener.py — Main pipeline orchestrator for Edgeware.
 
 Run directly:
-    python screener.py
+    python screener.py              # weekly mode: S&P 500 + S&P 400 (~900 tickers)
+    python screener.py --deep       # deep mode: full Finviz universe (~6 000+ tickers)
 
 The pipeline:
-  1. Fetch the S&P 500 universe from Wikipedia
-  2. Fetch financial data via yfinance (skips bad tickers gracefully)
+  1. Build the universe (weekly: SP500+SP400 | deep: Finviz cap_smallover)
+  2. Fetch financial data via Finviz (primary) + yfinance (fallback)
   3. Fetch insider transactions from SEC EDGAR Form 4
   4. Compute sector-level median P/E ratios
-  5. Apply the 7 screening filters sequentially
+  5. Apply sector exclusion (Healthcare removed) then 7 screening filters
   6. Score and rank survivors
   7. Generate a markdown report for the top 10
 """
 
 from __future__ import annotations
+
+from dotenv import load_dotenv
+load_dotenv()  # must run before any env-var reads or sub-module imports
 
 import logging
 import os
@@ -25,10 +29,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
-from dotenv import load_dotenv
-
-# Load .env before importing anything that reads env vars
-load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Logging setup (file + console)
@@ -52,7 +52,13 @@ logger = logging.getLogger(__name__)
 # Edgeware modules
 # ---------------------------------------------------------------------------
 
-from data import get_insider_transactions, get_sp500_tickers, get_stock_data
+from data import (
+    get_finviz_universe,
+    get_insider_transactions,
+    get_sp400_tickers,
+    get_sp500_tickers,
+    get_stock_data,
+)
 from filters import (
     compute_watch_flags,
     filter_analyst_coverage,
@@ -62,6 +68,7 @@ from filters import (
     filter_pe_vs_sector,
     filter_peg_ratio,
     filter_revenue_acceleration,
+    filter_sector_exclusion,
 )
 from report import generate_report
 from scorer import score_stocks
@@ -72,6 +79,57 @@ from scorer import score_stocks
 
 MAX_FAIL_RATE = 0.20  # abort if more than 20% of fetches fail
 
+
+# ---------------------------------------------------------------------------
+# Universe helpers
+# ---------------------------------------------------------------------------
+
+def _build_weekly_universe() -> List[Dict[str, str]]:
+    """
+    Build the standard weekly universe: S&P 500 + S&P 400 MidCap.
+    Deduplicates on ticker symbol.  Returns combined list of
+    {ticker, company, sector} dicts.
+    """
+    sp500 = get_sp500_tickers()
+    sp400 = get_sp400_tickers()
+
+    seen: set = set()
+    combined: List[Dict[str, str]] = []
+    for entry in sp500 + sp400:
+        t = entry["ticker"]
+        if t not in seen:
+            seen.add(t)
+            combined.append(entry)
+
+    logger.info(
+        "Weekly universe: %d SP500 + %d SP400 = %d unique tickers",
+        len(sp500),
+        len(sp400),
+        len(combined),
+    )
+    return combined
+
+
+def _build_deep_universe() -> List[Dict[str, str]]:
+    """
+    Build the deep quarterly universe: all Finviz cap_smallover stocks (~6 000+).
+    Falls back to the weekly universe if Finviz scraping fails entirely.
+    """
+    logger.info("Deep mode: scraping Finviz universe (this may take several minutes) …")
+    universe = get_finviz_universe()
+    if len(universe) < 500:
+        logger.warning(
+            "Finviz universe returned only %d tickers — "
+            "falling back to weekly SP500+SP400 universe",
+            len(universe),
+        )
+        return _build_weekly_universe()
+    return universe
+
+
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
 
 def _compute_sector_median_pe(
     all_stocks: List[Dict[str, Any]],
@@ -98,34 +156,51 @@ def _compute_sector_median_pe(
 
 def run_pipeline(
     *,
+    deep: bool = False,
     universe_override: Optional[List[Dict[str, str]]] = None,
 ) -> Optional[List[Dict[str, Any]]]:
     """
     Execute the full Edgeware screening pipeline.
 
     Args:
-        universe_override: If provided, use this list instead of fetching
-                           the S&P 500 from Wikipedia.  Useful for testing.
+        deep:              If True use the full Finviz universe (~6 000 tickers).
+                           Default False uses S&P 500 + S&P 400 (~900 tickers).
+        universe_override: Override both modes; pass an explicit list of
+                           {ticker, company, sector} dicts (useful for tests).
 
     Returns:
         Top-10 ranked stocks (or fewer if fewer survived), or None on fatal error.
     """
     start_time = datetime.now()
+    mode_label = "DEEP (Finviz)" if deep else "WEEKLY (SP500+SP400)"
     logger.info("=" * 70)
-    logger.info("Edgeware — pipeline started at %s", start_time.strftime("%Y-%m-%d %H:%M:%S"))
+    logger.info(
+        "Edgeware — pipeline started at %s  [%s]",
+        start_time.strftime("%Y-%m-%d %H:%M:%S"),
+        mode_label,
+    )
     logger.info("=" * 70)
 
     # ------------------------------------------------------------------ #
     # Step 1 — Universe                                                    #
     # ------------------------------------------------------------------ #
-    universe = universe_override or get_sp500_tickers()
+    if universe_override is not None:
+        universe = universe_override
+        universe_desc = f"override ({len(universe)} tickers)"
+    elif deep:
+        universe = _build_deep_universe()
+        universe_desc = f"Finviz deep ({len(universe)} tickers)"
+    else:
+        universe = _build_weekly_universe()
+        universe_desc = f"S&P 500 + S&P 400 ({len(universe)} tickers)"
+
     if not universe:
         logger.error("Empty universe — aborting")
         return None
-    logger.info("Universe: %d tickers", len(universe))
+    logger.info("Universe: %s", universe_desc)
 
     # ------------------------------------------------------------------ #
-    # Step 2 — Fetch financial data                                        #
+    # Step 2 — Fetch financial data (Finviz primary / yfinance fallback)  #
     # ------------------------------------------------------------------ #
     all_stocks: List[Dict[str, Any]] = []
     failed_fetch: List[str] = []
@@ -148,7 +223,7 @@ def run_pipeline(
                 )
             continue
 
-        # Enrich with Wikipedia sector when yfinance returns 'Unknown'
+        # Enrich sector/company from universe metadata when yfinance returns Unknown
         if stock.get("sector") in (None, "Unknown", ""):
             stock["sector"] = entry.get("sector", "Unknown")
         if not stock.get("company_name") or stock["company_name"] == ticker:
@@ -164,7 +239,7 @@ def run_pipeline(
         fail_rate * 100,
     )
     if failed_fetch:
-        logger.info("Failed tickers: %s", ", ".join(failed_fetch[:30]))
+        logger.info("Failed tickers (first 30): %s", ", ".join(failed_fetch[:30]))
 
     if not all_stocks:
         logger.error("No usable stock data retrieved — aborting")
@@ -189,9 +264,10 @@ def run_pipeline(
         stock["sector_median_pe"] = sector_median_pe.get(stock.get("sector"))
 
     # ------------------------------------------------------------------ #
-    # Step 5 — Apply filters                                               #
+    # Step 5 — Apply sector exclusion then 7 screening filters            #
     # ------------------------------------------------------------------ #
     filter_stats: Dict[str, int] = {
+        "passed_sector": 0,
         "passed_f1_peg": 0,
         "passed_f2_revenue": 0,
         "passed_f3_gm": 0,
@@ -206,6 +282,12 @@ def run_pipeline(
 
     for stock in all_stocks:
         ticker = stock["ticker"]
+
+        # ── Sector exclusion (Healthcare) ─────────────────────────────
+        if not filter_sector_exclusion(stock):
+            eliminated_at["Sector Exclusion"] += 1
+            continue
+        filter_stats["passed_sector"] += 1
 
         # ── Filter 1: PEG ──────────────────────────────────────────────
         f1_pass, peg_val = filter_peg_ratio(stock)
@@ -242,7 +324,7 @@ def run_pipeline(
             continue
         filter_stats["passed_f5_analysts"] += 1
 
-        # ── Filter 6: Insider buying ───────────────────────────────────
+        # ── Filter 6: Insider activity ─────────────────────────────────
         f6_pass, net_buy = filter_insider_buying(stock)
         if not f6_pass:
             eliminated_at["F6 Insider"] += 1
@@ -259,25 +341,25 @@ def run_pipeline(
         stock["watch_flags"] = compute_watch_flags(stock, sector_median_pe)
         filter_stats["passed_all"] += 1
         passed.append(stock)
-        logger.info("✓ %s passed all 7 filters", ticker)
+        logger.info("✓ %s passed all filters", ticker)
 
     # Log funnel
     logger.info("-" * 50)
     logger.info("Filter funnel (from %d stocks with valid data):", len(all_stocks))
     for stage, count in filter_stats.items():
         logger.info("  %s: %d", stage, count)
-    logger.info("Eliminated at each filter:")
-    for filt, count in sorted(eliminated_at.items()):
-        logger.info("  %s: %d eliminated", filt, count)
+    logger.info("Eliminated at each stage:")
+    for stage, count in sorted(eliminated_at.items()):
+        logger.info("  %s: %d eliminated", stage, count)
     logger.info("-" * 50)
 
     if not passed:
-        logger.warning("No stocks survived all 7 filters — report will be empty")
+        logger.warning("No stocks survived all filters — report will be empty")
         generate_report(
             [],
             date=start_time,
             pipeline_stats={
-                "universe": f"S&P 500 ({len(universe)} tickers)",
+                "universe": universe_desc,
                 "passed": 0,
                 "failed_fetch": len(failed_fetch),
             },
@@ -301,7 +383,7 @@ def run_pipeline(
         top_10,
         date=start_time,
         pipeline_stats={
-            "universe": f"S&P 500 ({len(universe)} tickers)",
+            "universe": universe_desc,
             "passed": len(passed),
             "failed_fetch": len(failed_fetch),
         },
@@ -324,7 +406,24 @@ def run_pipeline(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    result = run_pipeline()
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Edgeware Stock Screener",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--deep",
+        action="store_true",
+        help=(
+            "Deep mode (quarterly): scrape the full Finviz universe "
+            "(~6 000+ tickers with market cap > $300M) instead of the "
+            "default weekly S&P 500 + S&P 400 universe."
+        ),
+    )
+    args = parser.parse_args()
+
+    result = run_pipeline(deep=args.deep)
     if result is None:
         sys.exit(1)
     sys.exit(0)

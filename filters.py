@@ -17,6 +17,33 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Sector exclusion (pre-filter)
+# ---------------------------------------------------------------------------
+
+# yfinance returns "Healthcare"; some data sources use "Health Care"
+EXCLUDED_SECTORS: set = {"Healthcare", "Health Care"}
+
+
+def filter_sector_exclusion(data: Dict[str, Any]) -> bool:
+    """
+    Return False (excluded) when the stock belongs to a blocked sector.
+    Currently excludes: Healthcare / Health Care.
+
+    This runs *before* the numbered filters so excluded stocks never
+    consume Finviz rate-limited quota or clutter the funnel stats.
+    """
+    sector = (data.get("sector") or "").strip()
+    if sector in EXCLUDED_SECTORS:
+        logger.debug(
+            "%s: excluded — sector '%s' is in EXCLUDED_SECTORS",
+            data.get("ticker"),
+            sector,
+        )
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Filter 1 — PEG ratio
 # ---------------------------------------------------------------------------
 
@@ -141,20 +168,39 @@ def filter_analyst_coverage(
 
 
 # ---------------------------------------------------------------------------
-# Filter 6 — Insider buying (net)
+# Filter 6 — Insider selling (net)
 # ---------------------------------------------------------------------------
 
 def filter_insider_buying(
     data: Dict[str, Any],
+    selling_threshold: float = -500_000,
 ) -> Tuple[bool, float]:
     """
-    Pass when the net insider dollar flow (buys − sells) is positive
-    over the trailing 90 days.
+    Eliminate only stocks with *significant* net insider selling.
+
+    A stock PASSES when:
+      • there is no insider activity at all     (net == 0)
+      • insiders are net buyers                 (net > 0)
+      • net selling is below the threshold      (net > selling_threshold)
+
+    A stock FAILS only when net dollar selling exceeds *selling_threshold*
+    in absolute value (default: −$500 000 over the trailing 90 days).
+
+    This is intentionally permissive: the filter screens out conviction
+    sellers, not companies that simply lack recent insider activity.
 
     Returns (passed, net_dollar_value).
     """
     net = float(data.get("net_insider_buying", 0.0) or 0.0)
-    return net > 0, net
+    passed = net > selling_threshold
+    if not passed:
+        logger.debug(
+            "%s: F6 fail — net insider selling $%,.0f exceeds threshold $%,.0f",
+            data.get("ticker"),
+            net,
+            selling_threshold,
+        )
+    return passed, net
 
 
 # ---------------------------------------------------------------------------
@@ -246,9 +292,14 @@ def compute_watch_flags(
     if gm_exp is not None and 0 < gm_exp < 0.005:  # < 0.5 pp expansion
         flags.append(f"Gross margin expansion marginal: +{gm_exp:.2%}")
 
-    # Net insider buying very small
+    # Insider activity watch flags
     net_buy = data.get("net_insider_buying", 0) or 0
-    if 0 < net_buy < 100_000:  # < $100 K
+    if -500_000 < net_buy <= -250_000:
+        # Selling is between 50 % and 100 % of the elimination threshold
+        flags.append(
+            f"Insider selling approaching threshold: ${net_buy:,.0f} (limit −$500K)"
+        )
+    elif 0 < net_buy < 100_000:  # net buying but very small (< $100 K)
         flags.append(f"Insider buying minimal: ${net_buy:,.0f}")
 
     if flags:
