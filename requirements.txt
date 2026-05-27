@@ -1,0 +1,9 @@
+yfinance>=0.2.38
+pandas>=2.0.0
+numpy>=1.24.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+anthropic>=0.25.0
+schedule>=1.2.0
+python-dotenv>=1.0.0
